@@ -1,0 +1,110 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mongodb"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id         String   @id @default(auto()) @map("_id") @db.ObjectId
+  email      String   @unique
+  password   String
+  role       String   @default("USER")
+
+  // Seller profile
+  fullName   String?
+  phone      String?
+  whatsapp   String?
+  city       String?
+  sellerType String   @default("PRIVATE") // PRIVATE | DEALER
+
+  // Seller location
+  address    String?
+  lat        Float?
+  lng        Float?
+
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  cars       Car[]
+
+  // ✅ Seller verification (NEW)
+  verification SellerVerification?
+}
+
+model SellerVerification {
+  id         String             @id @default(auto()) @map("_id") @db.ObjectId
+  userId     String             @unique @db.ObjectId
+  idType     String
+  idNumber   String?
+  idImage    String
+  selfie     String
+  status     VerificationStatus @default(PENDING)
+  note       String?
+  createdAt  DateTime           @default(now())
+  reviewedAt DateTime?
+
+  user       User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+enum VerificationStatus {
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+model Car {
+  id           String   @id @default(auto()) @map("_id") @db.ObjectId
+
+  title        String
+  brand        String
+  model        String
+  year         Int
+  price        Float
+
+  // ✅ Car highlights
+  mileage      Int?      // kilometers
+  condition    String?   // NEW | USED
+  transmission String?   // AUTOMATIC | MANUAL
+  fuel         String?   // Electric | Hybrid | Petrol | Diesel
+
+  // ✅ Car details
+  carType      String?   // SUV | Sedan | Hatchback | Truck
+  color        String?
+
+  description  String?
+  images       String[]
+  published    Boolean   @default(true)
+
+  // Status
+  status       String    @default("ACTIVE") // ACTIVE | PAUSED | SOLD
+  soldAt       DateTime?
+
+  // Location (car specific)
+  address      String?
+  lat          Float?
+  lng          Float?
+
+  ownerId      String   @db.ObjectId
+  owner        User     @relation(fields: [ownerId], references: [id])
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model Catalog {
+  id          String   @id @default(auto()) @map("_id") @db.ObjectId
+  name        String
+  description String?
+  createdAt   DateTime @default(now())
+}
+
+model CatalogMake {
+  id          String   @id @default(auto()) @map("_id") @db.ObjectId
+  make        String   @unique
+  models      String[]
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}

@@ -1,0 +1,274 @@
+// ✅ FILE: prisma/schema.prisma
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mongodb"
+  url      = env("DATABASE_URL")
+}
+
+/**
+ * =========================
+ * ✅ USERS
+ * =========================
+ */
+model User {
+  id       String @id @default(auto()) @map("_id") @db.ObjectId
+  email    String @unique
+  password String
+  role     String @default("USER")
+
+  // Seller profile
+  fullName   String?
+  phone      String?
+  whatsapp   String?
+  city       String?
+  sellerType String @default("PRIVATE") // PRIVATE | DEALER
+
+  // Seller location
+  address String?
+  lat     Float?
+  lng     Float?
+
+  // ✅ Phone/Email verification
+  phoneVerified Boolean @default(false)
+  emailVerified Boolean @default(false)
+  verifiedAt    DateTime?
+
+  // ✅ OTP (hashed code only)
+  otpHash      String?
+  otpTarget    String?
+  otpChannel   String? // SMS | EMAIL
+  otpPurpose   String? // PHONE_VERIFY | EMAIL_VERIFY
+  otpExpiresAt DateTime?
+
+  // ✅ Anti-abuse / rate-limit
+  otpSendCount   Int @default(0)
+  otpLastSentAt  DateTime?
+  otpFailCount   Int @default(0)
+  otpLockedUntil DateTime?
+
+  // ✅ Dealer plans
+  planType                PlanType   @default(FREE)
+  planStatus              PlanStatus @default(NONE)
+  planUntil               DateTime?
+  maxActiveCars           Int        @default(3) // FREE default
+  includedFeaturedCredits Int        @default(0)
+  featuredCreditsUsed     Int        @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  cars Car[]
+
+  // ✅ Seller verification
+  verification SellerVerification?
+
+  // ✅ Payments
+  payments Payment[]
+}
+
+/**
+ * =========================
+ * ✅ SELLER VERIFICATION
+ * =========================
+ */
+model SellerVerification {
+  id         String             @id @default(auto()) @map("_id") @db.ObjectId
+  userId     String             @unique @db.ObjectId
+  idType     String
+  idNumber   String?
+  idImage    String
+  selfie     String
+  status     VerificationStatus @default(PENDING)
+  note       String?
+  createdAt  DateTime           @default(now())
+  reviewedAt DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+enum VerificationStatus {
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+/**
+ * =========================
+ * ✅ PROMOTION ENUM (kept for Car ranking)
+ * =========================
+ */
+enum ListingTier {
+  STANDARD
+  BOOST
+  FEATURED
+}
+
+/**
+ * =========================
+ * ✅ PLANS + PAYMENTS
+ * =========================
+ */
+enum PlanType {
+  FREE
+  DEALER_STARTER
+  DEALER_PRO
+  DEALER_ELITE
+}
+
+enum PlanStatus {
+  NONE
+  ACTIVE
+  PAST_DUE
+  CANCELED
+}
+
+enum PaymentType {
+  PLAN               // plan purchase (FREE/DEALER_*)
+  FEATURE_CAR        // make a car featured
+  BUMP               // bump a car
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  FAILED
+  REFUNDED
+  CANCELED
+  EXPIRED
+}
+
+/**
+ * ListingPlan = your price table (Standard / Featured / Dealer)
+ */
+model ListingPlan {
+  id           String  @id @default(auto()) @map("_id") @db.ObjectId
+  code         String  @unique // FREE, FEATURED_7D, FEATURED_30D, DEALER_*
+  name         String
+  currency     String  @default("XOF")
+  price        Int     @default(0)  // XOF/CFA
+  listingLimit Int     @default(0)  // 0 for per-car featured plans
+  featuredDays Int     @default(0)  // used for FEATURED_* plans
+  isActive     Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  payments Payment[]
+}
+
+model Payment {
+  id String @id @default(auto()) @map("_id") @db.ObjectId
+
+  userId String  @db.ObjectId
+  planId String? @db.ObjectId
+  carId  String? @db.ObjectId
+
+  // ✅ REQUIRED (this is why Prisma was crashing)
+  type PaymentType @default(PLAN)
+
+  // ✅ provider default (manual for now; later Wave)
+  provider    String @default("MANUAL")
+  providerRef String?
+
+  amount   Int
+  currency String @default("XOF")
+
+  status    PaymentStatus @default(PENDING)
+  reference String?       @unique
+  meta      Json?
+  paidAt    DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  plan ListingPlan? @relation(fields: [planId], references: [id])
+  car  Car?         @relation(fields: [carId], references: [id])
+
+  @@index([userId])
+  @@index([planId])
+  @@index([carId])
+  @@index([status])
+  @@index([type])
+}
+
+/**
+ * =========================
+ * ✅ CARS
+ * =========================
+ */
+model Car {
+  id    String @id @default(auto()) @map("_id") @db.ObjectId
+  title String
+  brand String
+  model String
+  year  Int
+  price Float
+
+  // ✅ Car highlights
+  mileage      Int?    // kilometers
+  condition    String? // NEW | USED
+  transmission String? // AUTOMATIC | MANUAL
+  fuel         String? // Electric | Hybrid | Petrol | Diesel
+
+  // ✅ Car details
+  carType      String? // SUV | Sedan | Hatchback | Truck
+  color        String?
+  description  String?
+  images       String[]
+
+  published Boolean @default(true)
+
+  // Status
+  status String @default("ACTIVE") // ACTIVE | PAUSED | SOLD
+  soldAt DateTime?
+
+  // ✅ Promotion / ranking (kept)
+  tier          ListingTier @default(STANDARD)
+  promotedUntil DateTime?
+  boostedScore  Int         @default(0)
+
+  // ⭐ Featured
+  isFeatured    Boolean  @default(false)
+  featuredUntil DateTime?
+
+  // ⭐ Bump
+  bumpedAt DateTime?
+
+  // Location (car specific)
+  address String?
+  lat     Float?
+  lng     Float?
+
+  ownerId String @db.ObjectId
+  owner   User   @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+
+  payments Payment[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+/**
+ * =========================
+ * ✅ CATALOG
+ * =========================
+ */
+model Catalog {
+  id          String @id @default(auto()) @map("_id") @db.ObjectId
+  name        String
+  description String?
+  createdAt   DateTime @default(now())
+}
+
+model CatalogMake {
+  id        String @id @default(auto()) @map("_id") @db.ObjectId
+  make      String @unique
+  models    String[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
