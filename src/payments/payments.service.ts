@@ -6,7 +6,6 @@ import {
   BadRequestException,
   ForbiddenException,
   NotFoundException,
-  InternalServerErrorException,
 } from "@nestjs/common";
 import { PrismaService } from "../prisma/prisma.service";
 import Stripe from "stripe";
@@ -31,24 +30,11 @@ function makeReference() {
 
 @Injectable()
 export class PaymentsService {
-  private stripe: Stripe;
+  private stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "", {
+    apiVersion: "2026-01-28.clover",
+  });
 
-  constructor(private prisma: PrismaService) {
-    const key = process.env.STRIPE_SECRET_KEY || "";
-
-    // ✅ HARD FAIL if env is wrong (prevents the exact production bug you hit)
-    if (!key || !key.startsWith("sk_")) {
-      // Don't leak key content, just fail clearly
-      throw new Error(
-        "STRIPE_SECRET_KEY is missing or invalid (must start with sk_)"
-      );
-    }
-
-    this.stripe = new Stripe(key, {
-      // ✅ Use a real Stripe API version (stable)
-      apiVersion: "2023-10-16",
-    });
-  }
+  constructor(private prisma: PrismaService) {}
 
   // ✅ PUBLIC: return active plans
   async getActivePlans() {
@@ -114,61 +100,34 @@ export class PaymentsService {
     const currency = String(plan.currency || "XOF").toUpperCase();
     const zeroDecimal = ["XOF", "JPY", "KRW"].includes(currency);
 
-    try {
-      const session = await this.stripe.checkout.sessions.create({
-        mode: "payment",
-        client_reference_id: payment.id,
-        success_url: `${frontend}/payment-success?pid=${payment.id}`,
-        cancel_url: `${frontend}/payment-cancel?pid=${payment.id}`,
-        line_items: [
-          {
-            quantity: 1,
-            price_data: {
-              currency: currency.toLowerCase(),
-              unit_amount: zeroDecimal
-                ? Math.round(amount)
-                : Math.round(amount * 100),
-              product_data: { name: plan.name },
-            },
-          },
-        ],
-      });
-
-      return { payment, checkoutUrl: session.url };
-    } catch (e: any) {
-      // Optional: mark failed (keeps DB clean)
-      await this.prisma.payment.update({
-        where: { id: payment.id },
-        data: {
-          status: "FAILED" as any,
-          meta: {
-            ...(payment.meta as any),
-            stripeError: String(e?.message || "Stripe error"),
+    const session = await this.stripe.checkout.sessions.create({
+      mode: "payment",
+      client_reference_id: payment.id,
+      success_url: `${frontend}/payment-success?pid=${payment.id}`,
+      cancel_url: `${frontend}/payment-cancel?pid=${payment.id}`,
+      line_items: [
+        {
+          quantity: 1,
+          price_data: {
+            currency: currency.toLowerCase(),
+            unit_amount: zeroDecimal ? Math.round(amount) : Math.round(amount * 100),
+            product_data: { name: plan.name },
           },
         },
-      });
+      ],
+    });
 
-      throw new InternalServerErrorException(
-        e?.message || "Failed to create Stripe checkout"
-      );
-    }
+    return { payment, checkoutUrl: session.url };
   }
 
   // 🔥 Create FEATURE payment for specific car
-  async createFeaturePaymentForCar(
-    carId: string,
-    planCode: string,
-    userOrId: any
-  ) {
+  async createFeaturePaymentForCar(carId: string, planCode: string, userOrId: any) {
     const userId = extractUserId(userOrId);
-    if (!userId || !isObjectIdString(userId))
-      throw new ForbiddenException("Invalid user");
-    if (!carId || !isObjectIdString(carId))
-      throw new BadRequestException("Invalid car id");
+    if (!userId || !isObjectIdString(userId)) throw new ForbiddenException("Invalid user");
+    if (!carId || !isObjectIdString(carId)) throw new BadRequestException("Invalid car id");
 
     const code = String(planCode || "").trim().toUpperCase();
-    if (!code.startsWith("FEATURED_"))
-      throw new BadRequestException("Use FEATURED_* plan");
+    if (!code.startsWith("FEATURED_")) throw new BadRequestException("Use FEATURED_* plan");
 
     const car = await this.prisma.car.findUnique({ where: { id: carId } });
     if (!car) throw new NotFoundException("Car not found");
@@ -208,43 +167,24 @@ export class PaymentsService {
     const currency = String(plan.currency || "XOF").toUpperCase();
     const zeroDecimal = ["XOF", "JPY", "KRW"].includes(currency);
 
-    try {
-      const session = await this.stripe.checkout.sessions.create({
-        mode: "payment",
-        client_reference_id: payment.id,
-        success_url: `${frontend}/?payment=success&pid=${payment.id}&carId=${carId}`,
-        cancel_url: `${frontend}/?payment=cancel&pid=${payment.id}&carId=${carId}`,
-        line_items: [
-          {
-            quantity: 1,
-            price_data: {
-              currency: currency.toLowerCase(),
-              unit_amount: zeroDecimal
-                ? Math.round(amount)
-                : Math.round(amount * 100),
-              product_data: { name: plan.name },
-            },
-          },
-        ],
-      });
-
-      return { payment, checkoutUrl: session.url };
-    } catch (e: any) {
-      await this.prisma.payment.update({
-        where: { id: payment.id },
-        data: {
-          status: "FAILED" as any,
-          meta: {
-            ...(payment.meta as any),
-            stripeError: String(e?.message || "Stripe error"),
+    const session = await this.stripe.checkout.sessions.create({
+      mode: "payment",
+      client_reference_id: payment.id,
+      success_url: `${frontend}/?payment=success&pid=${payment.id}&carId=${carId}`,
+      cancel_url: `${frontend}/?payment=cancel&pid=${payment.id}&carId=${carId}`,
+      line_items: [
+        {
+          quantity: 1,
+          price_data: {
+            currency: currency.toLowerCase(),
+            unit_amount: zeroDecimal ? Math.round(amount) : Math.round(amount * 100),
+            product_data: { name: plan.name },
           },
         },
-      });
+      ],
+    });
 
-      throw new InternalServerErrorException(
-        e?.message || "Failed to create Stripe checkout"
-      );
-    }
+    return { payment, checkoutUrl: session.url };
   }
 
   // ✅ ADMIN: manual mark paid
@@ -287,15 +227,14 @@ export class PaymentsService {
     });
 
     // 🔥 Auto-feature if FEATURE_CAR
+    // ✅ IMPORTANT: only update fields that exist in Car model (isFeatured, featuredUntil)
     if (payment.type === "FEATURE_CAR" && payment.carId) {
       const daysRaw = Number(payment.plan?.featuredDays ?? 7);
       const safeDays = Number.isFinite(daysRaw)
         ? Math.min(90, Math.max(1, Math.floor(daysRaw)))
         : 7;
 
-      const featuredUntil = new Date(
-        Date.now() + safeDays * 24 * 60 * 60 * 1000
-      );
+      const featuredUntil = new Date(Date.now() + safeDays * 24 * 60 * 60 * 1000);
 
       await this.prisma.car.update({
         where: { id: payment.carId },
