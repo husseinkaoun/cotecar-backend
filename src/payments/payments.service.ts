@@ -1,13 +1,15 @@
 // ✅ FILE: src/payments/payments.service.ts
-// Service: list plans + create payment (manual for now) + admin mark paid
+// Service: list plans + create payment (Stripe Checkout) + admin mark paid (manual) + webhook mark paid + auto-feature car
 
 import {
   Injectable,
   BadRequestException,
   ForbiddenException,
   NotFoundException,
+  InternalServerErrorException,
 } from "@nestjs/common";
 import { PrismaService } from "../prisma/prisma.service";
+import Stripe from "stripe";
 
 function isObjectIdString(v: unknown): v is string {
   return typeof v === "string" && /^[a-f\d]{24}$/i.test(v);
@@ -29,9 +31,26 @@ function makeReference() {
 
 @Injectable()
 export class PaymentsService {
-  constructor(private prisma: PrismaService) {}
+  private stripe: Stripe;
 
-  // ✅ PUBLIC: return active plans for pricing page (safe fields only)
+  constructor(private prisma: PrismaService) {
+    const key = process.env.STRIPE_SECRET_KEY || "";
+
+    // ✅ HARD FAIL if env is wrong (prevents the exact production bug you hit)
+    if (!key || !key.startsWith("sk_")) {
+      // Don't leak key content, just fail clearly
+      throw new Error(
+        "STRIPE_SECRET_KEY is missing or invalid (must start with sk_)"
+      );
+    }
+
+    this.stripe = new Stripe(key, {
+      // ✅ Use a real Stripe API version (stable)
+      apiVersion: "2023-10-16",
+    });
+  }
+
+  // ✅ PUBLIC: return active plans
   async getActivePlans() {
     return this.prisma.listingPlan.findMany({
       where: { isActive: true },
@@ -48,7 +67,7 @@ export class PaymentsService {
     });
   }
 
-  // ✅ USER: Create a payment intent (PENDING) for a plan
+  // ✅ USER: Create payment for plan
   async createPaymentForPlan(planCode: string, userOrId: any) {
     const userId = extractUserId(userOrId);
     if (!userId || !isObjectIdString(userId)) {
@@ -68,23 +87,20 @@ export class PaymentsService {
       throw new BadRequestException("Invalid plan price");
     }
 
-    // ✅ PaymentType enum in your schema:
-    // FEATURE_CAR | DEALER_SUBSCRIPTION | BUMP
     const planCodeUpper = String(plan.code || "").toUpperCase();
     const type =
       planCodeUpper.startsWith("FEATURED_")
         ? "FEATURE_CAR"
         : planCodeUpper.startsWith("DEALER_")
         ? "DEALER_SUBSCRIPTION"
-        : "DEALER_SUBSCRIPTION";
+        : "PLAN";
 
     const payment = await this.prisma.payment.create({
       data: {
         userId,
-        planId: plan.id, // ok (your Payment.planId is optional, but we set it)
-        type: type as any, // Prisma enum value
-
-        provider: "MANUAL", // later Wave
+        planId: plan.id,
+        type: type as any,
+        provider: "STRIPE",
         amount,
         currency: plan.currency || "XOF",
         status: "PENDING",
@@ -94,17 +110,147 @@ export class PaymentsService {
       include: { plan: true },
     });
 
-    return payment;
+    const frontend = process.env.FRONTEND_URL || "http://localhost:5173";
+    const currency = String(plan.currency || "XOF").toUpperCase();
+    const zeroDecimal = ["XOF", "JPY", "KRW"].includes(currency);
+
+    try {
+      const session = await this.stripe.checkout.sessions.create({
+        mode: "payment",
+        client_reference_id: payment.id,
+        success_url: `${frontend}/payment-success?pid=${payment.id}`,
+        cancel_url: `${frontend}/payment-cancel?pid=${payment.id}`,
+        line_items: [
+          {
+            quantity: 1,
+            price_data: {
+              currency: currency.toLowerCase(),
+              unit_amount: zeroDecimal
+                ? Math.round(amount)
+                : Math.round(amount * 100),
+              product_data: { name: plan.name },
+            },
+          },
+        ],
+      });
+
+      return { payment, checkoutUrl: session.url };
+    } catch (e: any) {
+      // Optional: mark failed (keeps DB clean)
+      await this.prisma.payment.update({
+        where: { id: payment.id },
+        data: {
+          status: "FAILED" as any,
+          meta: {
+            ...(payment.meta as any),
+            stripeError: String(e?.message || "Stripe error"),
+          },
+        },
+      });
+
+      throw new InternalServerErrorException(
+        e?.message || "Failed to create Stripe checkout"
+      );
+    }
   }
 
-  // ✅ ADMIN: mark payment as PAID (manual verification)
+  // 🔥 Create FEATURE payment for specific car
+  async createFeaturePaymentForCar(
+    carId: string,
+    planCode: string,
+    userOrId: any
+  ) {
+    const userId = extractUserId(userOrId);
+    if (!userId || !isObjectIdString(userId))
+      throw new ForbiddenException("Invalid user");
+    if (!carId || !isObjectIdString(carId))
+      throw new BadRequestException("Invalid car id");
+
+    const code = String(planCode || "").trim().toUpperCase();
+    if (!code.startsWith("FEATURED_"))
+      throw new BadRequestException("Use FEATURED_* plan");
+
+    const car = await this.prisma.car.findUnique({ where: { id: carId } });
+    if (!car) throw new NotFoundException("Car not found");
+
+    if (String(car.ownerId) !== String(userId)) {
+      const role = extractUserRole(userOrId);
+      if (role !== "ADMIN") throw new ForbiddenException("Not your car");
+    }
+
+    const plan = await this.prisma.listingPlan.findFirst({
+      where: { code, isActive: true },
+    });
+    if (!plan) throw new NotFoundException("Plan not found");
+
+    const amount = Number(plan.price);
+    if (!Number.isFinite(amount) || amount < 0) {
+      throw new BadRequestException("Invalid plan price");
+    }
+
+    const payment = await this.prisma.payment.create({
+      data: {
+        userId,
+        planId: plan.id,
+        carId,
+        type: "FEATURE_CAR" as any,
+        provider: "STRIPE",
+        amount,
+        currency: plan.currency || "XOF",
+        status: "PENDING",
+        reference: makeReference(),
+        meta: { planCode: plan.code, carId },
+      },
+      include: { plan: true },
+    });
+
+    const frontend = process.env.FRONTEND_URL || "http://localhost:5173";
+    const currency = String(plan.currency || "XOF").toUpperCase();
+    const zeroDecimal = ["XOF", "JPY", "KRW"].includes(currency);
+
+    try {
+      const session = await this.stripe.checkout.sessions.create({
+        mode: "payment",
+        client_reference_id: payment.id,
+        success_url: `${frontend}/?payment=success&pid=${payment.id}&carId=${carId}`,
+        cancel_url: `${frontend}/?payment=cancel&pid=${payment.id}&carId=${carId}`,
+        line_items: [
+          {
+            quantity: 1,
+            price_data: {
+              currency: currency.toLowerCase(),
+              unit_amount: zeroDecimal
+                ? Math.round(amount)
+                : Math.round(amount * 100),
+              product_data: { name: plan.name },
+            },
+          },
+        ],
+      });
+
+      return { payment, checkoutUrl: session.url };
+    } catch (e: any) {
+      await this.prisma.payment.update({
+        where: { id: payment.id },
+        data: {
+          status: "FAILED" as any,
+          meta: {
+            ...(payment.meta as any),
+            stripeError: String(e?.message || "Stripe error"),
+          },
+        },
+      });
+
+      throw new InternalServerErrorException(
+        e?.message || "Failed to create Stripe checkout"
+      );
+    }
+  }
+
+  // ✅ ADMIN: manual mark paid
   async adminMarkPaid(paymentId: string, userOrId: any) {
     const role = extractUserRole(userOrId);
     if (role !== "ADMIN") throw new ForbiddenException("Admin only");
-
-    if (!paymentId || !isObjectIdString(paymentId)) {
-      throw new BadRequestException("Invalid payment id");
-    }
 
     const payment = await this.prisma.payment.findUnique({
       where: { id: paymentId },
@@ -117,5 +263,49 @@ export class PaymentsService {
       where: { id: paymentId },
       data: { status: "PAID", paidAt: new Date() },
     });
+  }
+
+  // ✅ STRIPE WEBHOOK: mark paid + auto-feature
+  async markPaidFromStripe(paymentId: string, stripeMeta: any) {
+    if (!paymentId || !isObjectIdString(paymentId)) return;
+
+    const payment = await this.prisma.payment.findUnique({
+      where: { id: paymentId },
+      include: { plan: true },
+    });
+    if (!payment) return;
+
+    if (payment.status === "PAID") return payment;
+
+    const updated = await this.prisma.payment.update({
+      where: { id: paymentId },
+      data: {
+        status: "PAID",
+        paidAt: new Date(),
+        meta: { ...(payment.meta as any), ...stripeMeta },
+      },
+    });
+
+    // 🔥 Auto-feature if FEATURE_CAR
+    if (payment.type === "FEATURE_CAR" && payment.carId) {
+      const daysRaw = Number(payment.plan?.featuredDays ?? 7);
+      const safeDays = Number.isFinite(daysRaw)
+        ? Math.min(90, Math.max(1, Math.floor(daysRaw)))
+        : 7;
+
+      const featuredUntil = new Date(
+        Date.now() + safeDays * 24 * 60 * 60 * 1000
+      );
+
+      await this.prisma.car.update({
+        where: { id: payment.carId },
+        data: {
+          isFeatured: true,
+          featuredUntil,
+        },
+      });
+    }
+
+    return updated;
   }
 }
